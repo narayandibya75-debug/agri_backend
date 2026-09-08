@@ -57,26 +57,34 @@ def download_google_drive_model(file_id: str, output: str) -> None:
 
     Strategy:
     1. Use an existing non-empty local file if available.
-    2. Try gdown.
-    3. If gdown fails, try Google's direct download endpoint.
-    4. Verify that the resulting file exists and is non-empty.
+    2. Try gdown using the Google Drive file URL.
+    3. Try Google's normal /uc download endpoint.
+    4. Handle Google's confirmation page for large files.
+    5. Never save an HTML page as a model file.
     """
 
-    # Already downloaded
     if os.path.exists(output) and os.path.getsize(output) > 0:
-        print(f"✓ Using existing {output}")
+        print(
+            f"✓ Using existing {output} "
+            f"({os.path.getsize(output) / (1024 * 1024):.2f} MB)"
+        )
         return
 
     print(f"⬇️ Downloading {output} from Google Drive...")
 
     # --------------------------------------------------------
-    # Attempt 1: gdown
+    # Attempt 1: gdown using the full Google Drive URL
     # --------------------------------------------------------
+    drive_url = f"https://drive.google.com/file/d/{file_id}/view"
+
     try:
+        print(f"⬇️ Trying gdown for {output}...")
+
         downloaded = gdown.download(
-            id=file_id,
+            url=drive_url,
             output=output,
-            quiet=False
+            quiet=False,
+            fuzzy=True
         )
 
         if (
@@ -93,7 +101,7 @@ def download_google_drive_model(file_id: str, output: str) -> None:
     except Exception as exc:
         print(f"⚠️ gdown failed for {output}: {exc}")
 
-    # Remove incomplete file before fallback
+    # Remove failed/incomplete file
     if os.path.exists(output):
         try:
             os.remove(output)
@@ -101,70 +109,158 @@ def download_google_drive_model(file_id: str, output: str) -> None:
             pass
 
     # --------------------------------------------------------
-    # Attempt 2: Google direct download endpoint
+    # Attempt 2: Google Drive normal download endpoint
     # --------------------------------------------------------
     try:
-        direct_url = (
-            "https://drive.usercontent.google.com/download"
-            f"?id={file_id}&export=download&confirm=t"
+        print(f"⬇️ Trying Google Drive direct download for {output}...")
+
+        session = requests.Session()
+
+        download_url = (
+            "https://drive.google.com/uc"
+            f"?export=download&id={file_id}"
         )
 
-        print(f"⬇️ Trying Google direct download for {output}...")
-
-        response = requests.get(
-            direct_url,
+        response = session.get(
+            download_url,
             stream=True,
-            timeout=120,
+            timeout=180,
             allow_redirects=True
         )
 
         response.raise_for_status()
 
-        content_type = response.headers.get("content-type", "").lower()
+        content_type = response.headers.get(
+            "content-type",
+            ""
+        ).lower()
 
-        # Google sometimes returns an HTML error/login/confirmation
-        # page instead of the requested file.
+        # ----------------------------------------------------
+        # Google may return an HTML confirmation page instead
+        # of the actual file, especially for larger files.
+        # ----------------------------------------------------
         if "text/html" in content_type:
-            raise RuntimeError(
-                "Google returned an HTML page instead of the model file."
+            html = response.text
+
+            import re
+
+            confirm_token = None
+
+            token_match = re.search(
+                r"confirm=([0-9A-Za-z_-]+)",
+                html
             )
 
-        with open(output, "wb") as file:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if token_match:
+                confirm_token = token_match.group(1)
+
+            # Another Google Drive confirmation pattern
+            if not confirm_token:
+                token_match = re.search(
+                    r'name="confirm"\s+value="([^"]+)"',
+                    html
+                )
+
+                if token_match:
+                    confirm_token = token_match.group(1)
+
+            if not confirm_token:
+                raise RuntimeError(
+                    "Google Drive returned an HTML page instead "
+                    "of the model file. The file may not be publicly "
+                    "accessible."
+                )
+
+            print(
+                f"⚠️ Google confirmation required for {output}. "
+                f"Retrying..."
+            )
+
+            confirmed_url = (
+                "https://drive.google.com/uc"
+                f"?export=download&id={file_id}"
+                f"&confirm={confirm_token}"
+            )
+
+            response = session.get(
+                confirmed_url,
+                stream=True,
+                timeout=180,
+                allow_redirects=True
+            )
+
+            response.raise_for_status()
+
+            content_type = response.headers.get(
+                "content-type",
+                ""
+            ).lower()
+
+            if "text/html" in content_type:
+                raise RuntimeError(
+                    "Google Drive still returned HTML after "
+                    "confirmation instead of the model file."
+                )
+
+        # ----------------------------------------------------
+        # Save to a temporary file first.
+        # This prevents a failed download from becoming a
+        # seemingly valid model file.
+        # ----------------------------------------------------
+        temp_output = output + ".part"
+
+        if os.path.exists(temp_output):
+            os.remove(temp_output)
+
+        with open(temp_output, "wb") as file:
+            for chunk in response.iter_content(
+                chunk_size=1024 * 1024
+            ):
                 if chunk:
                     file.write(chunk)
 
-        if os.path.exists(output) and os.path.getsize(output) > 0:
-            print(
-                f"✓ Successfully downloaded {output} "
-                f"({os.path.getsize(output) / (1024 * 1024):.2f} MB)"
+        if (
+            not os.path.exists(temp_output)
+            or os.path.getsize(temp_output) == 0
+        ):
+            raise RuntimeError(
+                "Downloaded file is empty."
             )
-            return
+
+        os.replace(temp_output, output)
+
+        print(
+            f"✓ Successfully downloaded {output} "
+            f"({os.path.getsize(output) / (1024 * 1024):.2f} MB)"
+        )
+
+        return
 
     except Exception as exc:
-        print(f"⚠️ Direct Google download failed for {output}: {exc}")
+        print(
+            f"⚠️ Google direct download failed for "
+            f"{output}: {exc}"
+        )
 
     # --------------------------------------------------------
-    # Both methods failed
+    # Failed
     # --------------------------------------------------------
     raise RuntimeError(
         f"\n"
         f"Failed to download {output} from Google Drive.\n"
+        f"\n"
         f"File ID: {file_id}\n"
         f"\n"
-        f"Please verify:\n"
-        f"1. Google Drive sharing is 'Anyone with the link'.\n"
-        f"2. Permission is 'Viewer'.\n"
-        f"3. The file is not restricted by Google Drive.\n"
-        f"4. The file ID is correct.\n"
+        f"Please verify that the Google Drive file is:\n"
+        f"  • Anyone with the link\n"
+        f"  • Viewer permission\n"
+        f"  • Not inside a restricted/shared-drive location\n"
         f"\n"
-        f"Google Drive file:\n"
-        f"https://drive.google.com/uc?id={file_id}"
+        f"Google Drive URL:\n"
+        f"https://drive.google.com/file/d/{file_id}/view"
     )
-
-
 # ============================================================
-# DOWNLOAD ONLY THE LARGE PYTORCH MODELS
+# DOWNLOAD ALL MODELS FROM GOOGLE DRIVE
 # ============================================================
 
 download_google_drive_model(
@@ -177,71 +273,59 @@ download_google_drive_model(
     CLASSES_PATH
 )
 
+download_google_drive_model(
+    CROP_MODEL_ID,
+    CROP_MODEL_PATH
+)
 
+download_google_drive_model(
+    YIELD_MODEL_ID,
+    YIELD_MODEL_PATH
+)
+
+download_google_drive_model(
+    SOIL_ML_MODEL_ID,
+    SOIL_ML_MODEL_PATH
+)
+
+download_google_drive_model(
+    IRRIGATION_ML_MODEL_ID,
+    IRRIGATION_ML_MODEL_PATH
+)
 # ============================================================
-# VERIFY LOCAL MODELS
+# LOAD SOIL ML MODEL
 # ============================================================
 
-def require_local_model(path: str) -> None:
-    """
-    Verify that a model expected to be present in the repository
-    actually exists.
-    """
+soil_ml_model = None
 
-    if not os.path.exists(path):
-        raise RuntimeError(
-            f"Required local model '{path}' was not found. "
-            f"Make sure it is committed to the GitHub repository."
-        )
-
-    if os.path.getsize(path) == 0:
-        raise RuntimeError(
-            f"Required local model '{path}' is empty."
-        )
-
+try:
+    soil_ml_model = joblib.load(SOIL_ML_MODEL_PATH)
+    print(f"✓ {SOIL_ML_MODEL_PATH} loaded")
+except Exception as exc:
     print(
-        f"✓ Found local model {path} "
-        f"({os.path.getsize(path) / (1024 * 1024):.2f} MB)"
+        f"⚠️ Could not load {SOIL_ML_MODEL_PATH}: {exc}"
     )
 
 
-require_local_model(CROP_MODEL_PATH)
-require_local_model(YIELD_MODEL_PATH)
-
-
 # ============================================================
-# OPTIONAL TRAINED MODELS
+# LOAD IRRIGATION ML MODEL
 # ============================================================
 
-# These files are recognized if they exist locally.
-#
-# IMPORTANT:
-# We do NOT automatically call them because their input feature
-# order has not been established here. Feeding the wrong features
-# into a trained model would produce misleading predictions.
-
-soil_ml_model = None
 irrigation_ml_model = None
 
-if os.path.exists(SOIL_ML_MODEL_PATH):
-    try:
-        soil_ml_model = joblib.load(SOIL_ML_MODEL_PATH)
-        print(f"✓ Loaded {SOIL_ML_MODEL_PATH}")
-    except Exception as exc:
-        print(
-            f"⚠️ Could not load {SOIL_ML_MODEL_PATH}: {exc}"
-        )
-
-if os.path.exists(IRRIGATION_ML_MODEL_PATH):
-    try:
-        irrigation_ml_model = joblib.load(IRRIGATION_ML_MODEL_PATH)
-        print(f"✓ Loaded {IRRIGATION_ML_MODEL_PATH}")
-    except Exception as exc:
-        print(
-            f"⚠️ Could not load {IRRIGATION_ML_MODEL_PATH}: {exc}"
-        )
-
-
+try:
+    irrigation_ml_model = joblib.load(
+        IRRIGATION_ML_MODEL_PATH
+    )
+    print(
+        f"✓ {IRRIGATION_ML_MODEL_PATH} loaded"
+    )
+except Exception as exc:
+    print(
+        f"⚠️ Could not load "
+        f"{IRRIGATION_ML_MODEL_PATH}: {exc}"
+    )
+    
 # ============================================================
 # LOAD CROP MODEL
 # ============================================================
