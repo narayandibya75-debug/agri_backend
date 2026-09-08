@@ -44,9 +44,8 @@ YIELD_MODEL_PATH = "yield_model.pkl"
 # These are acknowledged trained files.
 # Their exact feature schemas should be confirmed before
 # using them in prediction endpoints.
-SOIL_ML_MODEL_PATH = "soil_ml_model.pkl"
-IRRIGATION_ML_MODEL_PATH = "irrigation_model.pkl"
-
+SOIL_ML_MODEL_ID = "1bXDiPYOXAFKcxVMIyylZa_TcYorufDtA"
+IRRIGATION_ML_MODEL_ID = "1ny4qXolifwvh2hZAjiYwsCzAZOEDpi62"
 
 # ============================================================
 # GOOGLE DRIVE MODEL DOWNLOAD
